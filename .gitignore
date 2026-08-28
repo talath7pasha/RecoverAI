@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+recover_ai.db
+.streamlit/
+.DS_Store
