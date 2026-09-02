@@ -1,164 +1,286 @@
-# main.py
-import os
-from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import List, Optional, Dict
+import uvicorn
+import re
 
-from app.models.schemas import PaymentFailureEvent, RecoveryDecision, FailureCategory, RecoveryActionType
-from app.agents.graph_engine import recovery_agent_graph
-from app.services.audit_logger import AuditLedgerService
-from app.core.security import verify_razorpay_signature
-from app.core.database import SessionLocal, AuditLog
+app = FastAPI(title="RecoverAI Advanced Industry Engine")
 
-app = FastAPI(
-    title="RecoverAI: Intelligent Revenue Recovery Agent",
-    description="Multi-Agent payment recovery engine built with LangGraph for Razorpay Track 3",
-    version="2.2.0"
-)
+events_store = []
+total_at_risk = 0.0
+total_recovered = 0.0
 
-class PaymentSuccessEvent(BaseModel):
+GATEWAY_HEALTH = {
+    "HDFC_UPI_RAILS": {"success_rate": 42.4, "status": "DEGRADED", "latency_ms": 1240, "failover_target": "ICICI_DIRECT_SWITCH"},
+    "ICICI_DIRECT_SWITCH": {"success_rate": 97.8, "status": "HEALTHY", "latency_ms": 180, "failover_target": None},
+    "AXIS_AUTOPAY_SWITCH": {"success_rate": 95.1, "status": "HEALTHY", "latency_ms": 210, "failover_target": None},
+    "SBI_CORE_MANDATE": {"success_rate": 58.2, "status": "CONGESTED", "latency_ms": 890, "failover_target": "AXIS_AUTOPAY_SWITCH"}
+}
+
+# Merchant SKU Margin Catalog (Real-time Unit Economics Guard)
+SKU_MARGIN_CATALOG = {
+    "SKU_ELECTRONICS_FLAGSHIP": {"margin_pct": 8.5, "permissible_action": "ZERO_MARGIN_PERKS_ONLY"},
+    "SKU_APPAREL_LUXURY": {"margin_pct": 45.0, "permissible_action": "DYNAMIC_FLEX_INCENTIVE"},
+    "SKU_SUBSCRIPTION_SaaS": {"margin_pct": 85.0, "permissible_action": "HIGH_LTV_CUSTOM_RECOVERY"}
+}
+
+class PreFailureTelemetry(BaseModel):
+    session_id: str
+    idle_time_seconds: float
+    card_switches_count: int
+    otp_hesitation: bool
+    amount: float
+    sku_id: Optional[str] = "SKU_ELECTRONICS_FLAGSHIP"
+
+class SplitTenderRequest(BaseModel):
+    payment_id: str
+    primary_amount: float
+    primary_method: str
+    secondary_amount: float
+    secondary_method: str
+
+class PaymentFailureEvent(BaseModel):
+    event_id: str
+    payment_id: str
+    customer_id: str
+    customer_tier: str
+    preferred_language: str
+    amount: float
+    error_code: str
+    error_description: str
+    invoice_type: Optional[str] = "D2C_CHECKOUT"
+    days_overdue: Optional[int] = 0
+    sku_id: Optional[str] = "SKU_ELECTRONICS_FLAGSHIP"
+
+class SettlementRequest(BaseModel):
     payment_id: str
     amount: float
-    recovery_channel: Optional[str] = "RECOVER_AI_LINK"
+    coins_earned: int = 0
 
-def execute_recovery_pipeline(event: PaymentFailureEvent):
-    initial_state = {
-        "event": event.dict(),
-        "failure_category": None,
-        "root_cause_analysis": None,
-        "is_halted": False,
-        "halt_reason": None,
-        "recovery_action": None,
-        "recovery_probability": 0.0,
-        "retry_delay_seconds": 0,
-        "channel": None,
-        "upi_intent_uri": None,
-        "incentive_data": None,
-        "dunning_message": None,
-        "logs": []
+class NegotiationRequest(BaseModel):
+    payment_id: str
+    user_message: str
+    amount: float
+    customer_tier: str
+    sku_id: Optional[str] = "SKU_ELECTRONICS_FLAGSHIP"
+
+@app.get("/api/v1/telemetry/gateway-health")
+def get_gateway_health():
+    return GATEWAY_HEALTH
+
+@app.post("/api/v1/telemetry/pre-failure-nudge")
+def pre_failure_nudge(data: PreFailureTelemetry):
+    """Intercepts dropouts before official gateway failure occurs."""
+    sku_info = SKU_MARGIN_CATALOG.get(data.sku_id, {"margin_pct": 10.0, "permissible_action": "ZERO_MARGIN_PERKS_ONLY"})
+    
+    if data.otp_hesitation or data.idle_time_seconds >= 30:
+        return {
+            "intervention_triggered": True,
+            "risk_type": "OTP_DROPOUT_RISK",
+            "suggested_nudge": "⚡ Bank server slow? Switch to Instant 1-Tap UPI or Split into 2 installments.",
+            "allowed_perks": "RecoverCoins + Express Delivery (Zero Cart Margin Loss)",
+            "margin_safeguard_active": True,
+            "margin_band": f"{sku_info['margin_pct']}%"
+        }
+    return {"intervention_triggered": False}
+
+@app.post("/api/v1/split-tender-settle")
+def split_tender_settle(req: SplitTenderRequest):
+    """Aggregates balances across dual rails (e.g. UPI + Card)."""
+    global total_recovered, total_at_risk
+    total_val = req.primary_amount + req.secondary_amount
+    total_recovered += total_val
+    if total_at_risk >= total_val:
+        total_at_risk -= total_val
+        
+    coins = int(total_val * 0.10)
+    for ev in events_store:
+        if ev["payment_id"] == req.payment_id:
+            ev["status"] = "RECOVERED_SPLIT_TENDER"
+            break
+            
+    return {
+        "status": "SETTLED_DUAL_RAIL",
+        "primary_rail": f"Charged ₹{req.primary_amount:,.2f} via {req.primary_method}",
+        "secondary_rail": f"Charged ₹{req.secondary_amount:,.2f} via {req.secondary_method}",
+        "coins_unlocked": coins
     }
 
-    final_state = recovery_agent_graph.invoke(initial_state)
+@app.post("/api/v1/webhook/payment-failure")
+def handle_failure(event: PaymentFailureEvent):
+    global total_at_risk
+    total_at_risk += event.amount
+    
+    sku_info = SKU_MARGIN_CATALOG.get(event.sku_id, {"margin_pct": 10.0, "permissible_action": "ZERO_MARGIN_PERKS_ONLY"})
+    action = "EXPONENTIAL_BACKOFF_RETRY"
+    failure_cat = "TECHNICAL_GATEWAY_ERROR"
+    reasoning = "Switch timeout detected; scheduling retries."
+    prob = 0.85
+    channel = "WhatsApp"
+    active_switch = "HDFC_UPI_RAILS"
+    rerouted_switch = None
 
-    decision = RecoveryDecision(
-        payment_id=event.payment_id,
-        failure_category=FailureCategory(final_state["failure_category"]),
-        recommended_action=RecoveryActionType(final_state["recovery_action"]),
-        recovery_probability=final_state["recovery_probability"],
-        retry_delay_seconds=final_state["retry_delay_seconds"],
-        channel=final_state.get("channel"),
-        reasoning=final_state["root_cause_analysis"] if not final_state["is_halted"] else final_state["halt_reason"],
-        dunning_message=final_state.get("dunning_message")
-    )
+    if "TECHNICAL" in event.error_code or "SWITCH" in event.error_code or "TIMEOUT" in event.error_code:
+        rerouted_switch = GATEWAY_HEALTH["HDFC_UPI_RAILS"]["failover_target"]
+        action = "AUTONOMOUS_PSP_FAILOVER_REROUTE"
+        reasoning = f"HDFC UPI Rails degraded (42.4%). Auto-cascaded to {rerouted_switch} (97.8% health)."
+        prob = 0.94
+        channel = "WhatsApp"
 
-    AuditLedgerService.record_decision(event, decision)
+    elif event.invoice_type == "B2B_INVOICE" or event.days_overdue > 0:
+        failure_cat = "B2B_RECEIVABLES_OVERDUE"
+        if event.days_overdue <= 3:
+            action = "B2B_GENTLE_RECOVERY_NUDGE"
+            reasoning = f"Net-30 Invoice {event.days_overdue} days overdue. Dispatched statement."
+            prob = 0.91
+            channel = "Email"
+        elif event.days_overdue <= 10:
+            action = "B2B_EARLY_SETTLEMENT_INCENTIVE"
+            reasoning = f"Invoice {event.days_overdue} days overdue. Offering early clearance platform credits."
+            prob = 0.78
+            channel = "WhatsApp"
+        else:
+            action = "B2B_EXECUTIVE_ESCALATION"
+            reasoning = f"Invoice aging critical ({event.days_overdue} days). Auto-escalated to Key Account Manager."
+            prob = 0.45
+            channel = "Executive Desk"
 
-    print("\n" + "="*60)
-    print(f"🤖 [LangGraph Multi-Agent Telemetry] Payment: {event.payment_id}")
-    for log in final_state["logs"]:
-        print(f"  {log}")
-    print("="*60)
+    elif event.invoice_type == "SUBSCRIPTION_MANDATE" or "MANDATE" in event.error_code:
+        failure_cat = "SUBSCRIPTION_MANDATE_FAILURE"
+        action = "SMART_SALARY_CYCLE_RETRY"
+        reasoning = "AutoPay recurring debit failed. Sequenced next retry at optimal salary window (07:00 AM)."
+        prob = 0.88
+        channel = "In-App Push"
 
-# --- Interactive 1-Click Recovery Payment Screen ---
-@app.get("/pay/{payment_id}", response_class=HTMLResponse)
-async def serve_recovery_checkout(payment_id: str, amt: float = 1499.00):
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>RecoverAI Smart Checkout</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-        <style>
-            body {{ font-family: 'Inter', sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
-            .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 32px; width: 100%; max-width: 420px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }}
-            .brand {{ color: #38bdf8; font-weight: 700; font-size: 1.25rem; display: flex; align-items: center; gap: 8px; margin-bottom: 20px; }}
-            .amount-box {{ background: #0f172a; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 24px; border: 1px solid #1e293b; }}
-            .amount {{ font-size: 2.2rem; font-weight: 700; color: #10b981; margin: 4px 0; }}
-            .btn {{ background: linear-gradient(135deg, #0284c7, #2563eb); color: white; border: none; padding: 14px 20px; border-radius: 10px; width: 100%; font-size: 1rem; font-weight: 600; cursor: pointer; transition: 0.2s; }}
-            .btn:hover {{ opacity: 0.9; transform: translateY(-1px); }}
-            .secure {{ text-align: center; font-size: 0.75rem; color: #94a3b8; margin-top: 16px; }}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <div class="brand">💳 RecoverAI Smart Checkout</div>
-            <p style="color: #94a3b8; font-size: 0.9rem;">Your previous attempt failed. Complete your order instantly via our intelligent rescue link.</p>
-            <div class="amount-box">
-                <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">Amount Payable</div>
-                <div class="amount">₹{amt:,.2f}</div>
-                <div style="font-size: 0.8rem; color: #64748b;">Reference: {payment_id}</div>
-            </div>
-            <button class="btn" onclick="completePayment()">⚡ Complete 1-Tap Recovery</button>
-            <div class="secure">🔒 Encrypted via Razorpay Autonomous Recovery Agent</div>
-        </div>
-        <script>
-            async function completePayment() {{
-                const btn = document.querySelector('.btn');
-                btn.innerText = "Processing...";
-                btn.disabled = true;
-                try {{
-                    const res = await fetch('/webhook/razorpay/payment-success', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{ payment_id: '{payment_id}', amount: {amt} }})
-                    }});
-                    if (res.ok) {{
-                        document.querySelector('.card').innerHTML = `
-                            <div style="text-align:center; padding: 20px 0;">
-                                <div style="font-size: 3rem;">✅</div>
-                                <h2 style="color: #10b981; margin: 12px 0;">Payment Recovered!</h2>
-                                <p style="color: #94a3b8; font-size: 0.9rem;">₹{amt:,.2f} has been recovered and updated live on the Streamlit dashboard.</p>
-                                <button class="btn" style="margin-top: 16px;" onclick="window.close()">Close Window</button>
-                            </div>
-                        `;
-                    }}
-                }} catch(e) {{
-                    alert("Error settling mock recovery");
-                    btn.disabled = false;
-                }}
-            }}
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    elif "INSUFFICIENT" in event.error_code:
+        failure_cat = "INSUFFICIENT_FUNDS"
+        action = "SPLIT_PAYMENT_RECOVERY"
+        reasoning = "Insufficient funds detected; offering multi-account split tender recovery."
+        prob = 0.92
+    elif "FRAUD" in event.error_code:
+        failure_cat = "SUSPECTED_FRAUD"
+        action = "HALT_FRAUD_PREVENTION"
+        reasoning = "High-risk velocity flag; halting automated retry."
+        prob = 0.05
+        channel = "Email"
+    elif "AUTH" in event.error_code:
+        failure_cat = "AUTHENTICATION_FAILURE"
+        action = "ONE_TAP_UPI_LINK"
+        reasoning = "OTP timeout; rerouting to 1-Tap UPI flow."
+        prob = 0.89
 
-@app.post("/webhook/razorpay/payment-failed")
-async def handle_payment_failure(
-    event: PaymentFailureEvent, 
-    background_tasks: BackgroundTasks,
-    request: Request,
-    x_razorpay_signature: Optional[str] = Header(None)
-):
-    if x_razorpay_signature:
-        raw_body = await request.body()
-        if not verify_razorpay_signature(raw_body, x_razorpay_signature):
-            raise HTTPException(status_code=400, detail="Invalid Razorpay Webhook Signature")
+    entry = {
+        "event_id": event.event_id,
+        "payment_id": event.payment_id,
+        "amount": event.amount,
+        "failure_category": failure_cat,
+        "action_taken": action,
+        "recovery_probability": prob,
+        "channel": channel,
+        "status": "AT_RISK",
+        "reasoning": reasoning,
+        "coins_credited": int(event.amount * 0.10),
+        "invoice_type": event.invoice_type,
+        "days_overdue": event.days_overdue,
+        "active_gateway_switch": rerouted_switch or active_switch,
+        "sku_margin_pct": sku_info["margin_pct"]
+    }
+    events_store.insert(0, entry)
+    return {"status": "ACK", "processed_action": action}
 
-    background_tasks.add_task(execute_recovery_pipeline, event)
-    return {"status": "ORCHESTRATED_BY_LANGGRAPH", "payment_id": event.payment_id}
+@app.post("/api/v1/settle-recovery")
+def settle_recovery(req: SettlementRequest):
+    global total_recovered, total_at_risk
+    for ev in events_store:
+        if ev["payment_id"] == req.payment_id:
+            ev["status"] = "RECOVERED"
+            total_recovered += req.amount
+            if total_at_risk >= req.amount:
+                total_at_risk -= req.amount
+            break
+    return {"status": "SETTLED", "payment_id": req.payment_id, "coins_unlocked": req.coins_earned}
 
-@app.post("/webhook/razorpay/payment-success")
-async def handle_payment_success(event: PaymentSuccessEvent):
-    AuditLedgerService.mark_recovered(event.payment_id, event.amount)
-    return {"status": "RECORDED_RECOVERED_REVENUE", "payment_id": event.payment_id, "amount": event.amount}
+@app.post("/api/v1/conversational-negotiate")
+def negotiate(req: NegotiationRequest):
+    txt = req.user_message.lower().strip()
+    adjusted = req.amount
+    coins = int(req.amount * 0.10)
+    action = "FALLBACK"
+    
+    sku_info = SKU_MARGIN_CATALOG.get(req.sku_id, {"margin_pct": 8.5, "permissible_action": "ZERO_MARGIN_PERKS_ONLY"})
+    hinglish_words = ["bhai", "hai", "nahi", "kardo", "karo", "karna", "paise", "kuch", "milega", "bhejo", "kab", "dena", "parso", "kya", "aadha", "aayegi", "mat", "bhejna", "chahiye"]
+    is_hinglish = any(re.search(rf"\b{w}\b", txt) for w in hinglish_words)
 
-@app.post("/reset-ledger")
-async def reset_database():
-    db = SessionLocal()
-    try:
-        db.query(AuditLog).delete()
-        db.commit()
-        return {"status": "SUCCESS", "message": "Audit ledger cleared"}
-    finally:
-        db.close()
+    # 1. Promise-to-Pay (PTP)
+    if any(k in txt for k in ["tomorrow", "friday", "monday", "tuesday", "wednesday", "thursday", "saturday", "sunday", "next week", "later", "pay on", "salary", "kal", "parso", "baad me"]):
+        action = "PROMISE_TO_PAY_LOGGED"
+        if is_hinglish:
+            reply = f"📅 **Promise-to-Pay Confirm ho gaya!** Humne aapka order hold pe rakh diya hai aur alerts pause kar diye hain. Scheduled date pe 1-Tap link mil jayegi. Saath me **{coins} RecoverCoins** bhi milenge!"
+        else:
+            reply = f"📅 **Promise-to-Pay Confirmed!** We have locked your order and paused all recovery alerts. We will send a 1-Tap link on your scheduled date. You will still earn {coins} RecoverCoins!"
 
-@app.get("/metrics")
-async def get_dashboard_metrics():
-    return AuditLedgerService.get_metrics()
+    # 2. Compliance Opt-Out
+    elif any(k in txt for k in ["stop", "don't message", "cancel", "opt out", "unsubscribe", "mat bhejo", "spam", "band karo", "mat bhej"]):
+        action = "COMPLIANCE_OPTOUT_SUPPRESSED"
+        if is_hinglish:
+            reply = "🛑 **Outreach Suppress kar diya gaya:** Humne aapki request note kar li hai. Anti-Harassment policy ke tehat saare automatic alerts turant band kar diye gaye hain."
+        else:
+            reply = "🛑 **Outreach Suppressed:** All automated outreach has been immediately stopped in compliance with our Anti-Harassment policy."
 
-@app.get("/")
-def health_check():
-    return {"status": "online", "engine": "LangGraph Multi-Agent State Machine"}
+    # 3. Split-Payment / Split-Tender
+    elif any(k in txt for k in ["split", "part", "half", "two", "install", "installment", "aadha", "tukde", "balance"]):
+        action = "SPLIT_PAY_APPROVED"
+        adjusted = req.amount / 2
+        if is_hinglish:
+            reply = f"✅ **Split-Pay / Dual-Tender Activate ho gaya!** Abhi sirf ₹{adjusted:,.2f} (Part 1) pay karein, baaki amount 14 din baad. Saath me **{coins} RecoverCoins** bhi confirmed!"
+        else:
+            reply = f"✅ **Split-Tender Activated!** Pay ₹{adjusted:,.2f} now (Part 1) and the rest in 14 days or across dual payment methods. You still earn {coins} RecoverCoins!"
+
+    # 4. RecoverCoins / Perks (Bounded by SKU Margin Guard)
+    elif any(k in txt for k in ["coin", "point", "reward", "offer", "discount", "perk", "deal", "cashback", "kuch kam", "kam karo"]):
+        action = "RECOVER_COINS_UNLOCKED"
+        margin_guard_note = f"[🛡️ SKU Margin Guard: {sku_info['margin_pct']}% Margin Protected — Zero Cart Discount]"
+        if is_hinglish:
+            reply = f"🪙 **Reward Multiplier Active!** {margin_guard_note}\n\nAbhi order complete karne par aapko milenge **{coins} RecoverCoins** (Value: ₹{coins/10:,.2f} cash agle order ke liye) + Free Express Delivery!"
+        else:
+            reply = f"🪙 **Instant Reward Multiplier Active!** {margin_guard_note}\n\nComplete payment now to earn **{coins} RecoverCoins** (Value: ₹{coins/10:,.2f} cash credit for next order) + Free Express Priority Delivery!"
+
+    # 5. Direct UPI Link
+    elif any(k in txt for k in ["upi", "link", "pay", "gpay", "phonepe", "qr", "bhejo"]):
+        action = "UPI_ONE_TAP_APPROVED"
+        if is_hinglish:
+            reply = f"⚡ **Direct 1-Tap UPI Link ready hai.** Turant checkout karein aur apne **{coins} RecoverCoins** secure karein."
+        else:
+            reply = f"⚡ Direct 1-Tap UPI link configured. Complete now to secure your {coins} bonus coins."
+
+    else:
+        if is_hinglish:
+            reply = f"Hum aapki ₹{req.amount:,.2f} payment resolve karne me madad kar sakte hain. Aap 'Split', 'Coins offer', ya 'UPI link' likhkar reply kar sakte hain."
+        else:
+            reply = "I can assist you with completing this recovery payment. Reply with 'Split', 'Coins offer', or 'UPI link'."
+
+    checkout = f"http://localhost:8501/?checkout_id={req.payment_id}&amt={adjusted}&coins={coins}&sku_margin={sku_info['margin_pct']}"
+    return {"reply": reply, "action": action, "adjusted_amount": adjusted, "coins": coins, "checkout_url": checkout, "sku_margin": sku_info["margin_pct"]}
+
+@app.get("/api/v1/metrics")
+def get_metrics():
+    total_ev = len(events_store)
+    yield_rate = round((total_recovered / (total_at_risk + total_recovered) * 100), 2) if (total_at_risk + total_recovered) > 0 else 0.0
+    return {
+        "total_revenue_at_risk_inr": total_at_risk,
+        "total_revenue_recovered_inr": total_recovered,
+        "recovery_rate_percentage": yield_rate,
+        "total_events_processed": total_ev,
+        "recent_logs": events_store[:15]
+    }
+
+@app.post("/api/v1/reset-ledger")
+def reset():
+    global total_at_risk, total_recovered
+    events_store.clear()
+    total_at_risk = 0.0
+    total_recovered = 0.0
+    return {"status": "CLEARED"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
